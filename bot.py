@@ -2,9 +2,9 @@ import requests
 from pathlib import Path
 
 SOURCES = [
-    "https://example.com/source1.txt",
-    "https://example.com/source2.txt",
-    "https://example.com/source3.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+    "https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt",
 ]
 
 OUTPUT = "result.txt"
