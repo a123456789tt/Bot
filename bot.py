@@ -1,5 +1,5 @@
 import requests
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, quote, urlparse
 from pathlib import Path
 import socket
 import time
@@ -12,6 +12,7 @@ SOURCES = [
 
 OUTPUT = "result.txt"
 
+# ↓ Вы можете заменить этот словарь на свой (как вы правили на скриншотах)
 COUNTRIES = {
     "🇳🇱": ("Нидерланды", 5),
     "🇫🇮": ("Финляндия", 5),
@@ -32,7 +33,10 @@ COUNTRIES = {
 }
 
 PING_LIMIT_MS = 800
-TCP_TIMEOUT = 2.0  # секунды, чтобы не ждать слишком долго
+TCP_TIMEOUT = 1.5          # ← вы уменьшили до 1.5 секунд
+UPDATE_INTERVAL = 3600     # 1 час (используется только для вывода)
+
+BLACKLIST_WORDS = ["analyst"]  # если нужно, добавьте свои
 
 
 def download(url):
@@ -53,23 +57,33 @@ def decode_name(line):
     return name
 
 
-def find_country(line):
-    decoded_name = decode_name(line)
+def find_country(line, decoded_cache):
+    """Возвращает флаг и страну, используя кеш декодированных имён"""
+    if line not in decoded_cache:
+        decoded_cache[line] = decode_name(line)
+    decoded = decoded_cache[line]
     for flag, (country, _) in COUNTRIES.items():
-        if flag in decoded_name:
+        if flag in decoded:
             return flag, country
     return None
+
+
+def is_blacklisted(line, decoded_cache):
+    """Проверяет наличие слов из BLACKLIST_WORDS в строке или её декодированном имени"""
+    if line not in decoded_cache:
+        decoded_cache[line] = decode_name(line)
+    decoded = decoded_cache[line]
+    check_text = (line + " " + decoded).lower()
+    return any(word in check_text for word in BLACKLIST_WORDS)
 
 
 def get_host_port(vless_line):
     """Извлекает хост и порт из строки вида vless://uuid@host:port?params"""
     try:
-        # Обрезаем возможный фрагмент после '#'
         raw = vless_line.split('#')[0].strip()
         parsed = urlparse(raw)
         if parsed.hostname and parsed.port:
             return parsed.hostname, parsed.port
-        # Если порт не указан, стандартный для VLESS – 443
         if parsed.hostname:
             return parsed.hostname, 443
     except Exception:
@@ -82,7 +96,7 @@ def check_ping(host, port):
     try:
         start = time.time()
         with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
-            elapsed = (time.time() - start) * 1000  # в мс
+            elapsed = (time.time() - start) * 1000
         if elapsed <= PING_LIMIT_MS:
             return elapsed
     except Exception:
@@ -91,9 +105,13 @@ def check_ping(host, port):
 
 
 def main():
-    # Словарь для хранения кандидатов: flag -> list of (line, ping_ms)
+    print("Запущен автообновляемый сборщик конфигов")
+    print(f"Интервал обновления: {UPDATE_INTERVAL // 60} минут")
+    print("Нажмите Ctrl+C для остановки.\n")
+
     candidates = {flag: [] for flag in COUNTRIES}
-    seen = set()  # для уникальности строк
+    seen = set()
+    decoded_cache = {}
 
     for url in SOURCES:
         print(f"Загрузка: {url}")
@@ -103,32 +121,43 @@ def main():
             print(f"Ошибка загрузки: {e}")
             continue
 
-        for line in text.splitlines():
+        lines = text.splitlines()
+        total_lines = len(lines)
+        print(f"В источнике строк: {total_lines}")
+
+        processed = 0
+        for line in lines:
             line = line.strip()
+            processed += 1
+            if processed % 10 == 0:
+                print(f"Обработано {processed}/{total_lines} строк...", end='\r')
+
             if not line or line in seen:
                 continue
 
-            result = find_country(line)
+            if is_blacklisted(line, decoded_cache):
+                continue
+
+            result = find_country(line, decoded_cache)
             if result is None:
                 continue
 
             flag, _ = result
 
-            # Извлекаем хост и порт
             host, port = get_host_port(line)
             if not host or not port:
                 continue
 
-            # Проверяем пинг
             ping = check_ping(host, port)
             if ping is None:
-                continue  # не прошёл по времени или недоступен
+                continue
 
-            # Сохраняем
             candidates[flag].append((line, ping))
             seen.add(line)
 
-    # Формируем итоговый список для вывода
+        print(f"Обработано {processed}/{total_lines} строк полностью.")
+
+    # Формируем вывод – только блоки стран, без заголовков
     output_lines = []
     total = 0
 
@@ -137,31 +166,33 @@ def main():
         if not items:
             continue
 
-        # Сортируем по пингу (от лучшего к худшему)
         items.sort(key=lambda x: x[1])
-
-        # Берём не больше лимита (если меньше – все)
         selected = items[:limit] if len(items) >= limit else items
 
         output_lines.append(f"# {flag} {country}")
         for line, _ in selected:
             output_lines.append(line)
-        output_lines.append("")  # пустая строка после блока
+        output_lines.append("")   # пустая строка между блоками
 
         total += len(selected)
 
-    # Записываем результат
-    Path(OUTPUT).write_text("\n".join(output_lines), encoding="utf-8")
+    # Записываем, убирая последний лишний перевод строки
+    content = "\n".join(output_lines).rstrip()
+    Path(OUTPUT).write_text(content, encoding="utf-8")
 
-    print()
-    print("Результат:")
+    print(f"\nГотово! Сохранено {total} конфигов.")
+    print("Статистика по странам:")
     for flag, (country, limit) in COUNTRIES.items():
         count = len(candidates[flag])
         if count:
             print(f"{flag} {country}: {count} проверено, выбрано {min(count, limit)} (лимит {limit})")
-    print(f"Всего строк в результате: {total}")
-    print(f"Готово: {OUTPUT}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("\n=== Ошибка в bot.py ===")
+        traceback.print_exc()
+        raise   # чтобы GitHub Actions зафиксировал сбой
