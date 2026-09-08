@@ -3,9 +3,7 @@ from urllib.parse import unquote, quote, urlparse
 from pathlib import Path
 import socket
 import time
-import sys
 
-# ---------- НАСТРОЙКИ ----------
 SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
@@ -15,7 +13,7 @@ SOURCES = [
 OUTPUT = "result.txt"
 
 COUNTRIES = {
-    "🇳🇱": ("Нидерланды", 10),
+    "🇳🇱": ("Нидерланды", 5),
     "🇫🇮": ("Финляндия", 5),
     "🇩🇪": ("Германия", 5),
     "🇷🇺": ("Россия", 10),
@@ -31,29 +29,20 @@ COUNTRIES = {
     "🇸🇪": ("Швеция", 5),
     "🇹🇷": ("Турция", 5),
     "🇵🇱": ("Польша", 5),
-    "🇧🇷": ("Бразилия", 3),
-    "🇦🇹": ("Австрия", 3),
-    "🇪🇪": ("Эстония", 3),
-    "🇩🇰": ("Дания", 3),
-    "🇪🇸": ("Испания", 3),
-    "🇮🇹": ("Италия", 3),
-    "🇨🇭": ("Швейцария", 3),
-    "🇲🇳": ("Монголия", 3),
-    "🇨🇳": ("Китай", 1),
-    "🇮🇳": ("Индия", 3),
 }
 
 PING_LIMIT_MS = 800
-TCP_TIMEOUT = 1.5
-UPDATE_INTERVAL = 3600  # 1 час
+TCP_TIMEOUT = 2.0
 
+# Список запрещённых слов (регистронезависимо)
 BLACKLIST_WORDS = ["analyst"]
 
-# ---------- ФУНКЦИИ ----------
+
 def download(url):
     response = requests.get(url, timeout=30)
     response.raise_for_status()
     return response.text
+
 
 def decode_name(line):
     if "#" not in line:
@@ -66,23 +55,25 @@ def decode_name(line):
         name = decoded
     return name
 
-def find_country(line, decoded_cache):
-    if line not in decoded_cache:
-        decoded_cache[line] = decode_name(line)
-    decoded = decoded_cache[line]
+
+def is_blacklisted(line):
+    """Проверяет, содержит ли строка или её декодированный комментарий запрещённые слова."""
+    decoded = decode_name(line)
+    # Объединяем исходную строку и декодированный комментарий для проверки
+    text_to_check = (line + " " + decoded).lower()
+    return any(word in text_to_check for word in BLACKLIST_WORDS)
+
+
+def find_country(line):
+    decoded_name = decode_name(line)
     for flag, (country, _) in COUNTRIES.items():
-        if flag in decoded:
+        if flag in decoded_name:
             return flag, country
     return None
 
-def is_blacklisted(line, decoded_cache):
-    if line not in decoded_cache:
-        decoded_cache[line] = decode_name(line)
-    decoded = decoded_cache[line]
-    check_text = (line + " " + decoded).lower()
-    return any(word in check_text for word in BLACKLIST_WORDS)
 
 def get_host_port(vless_line):
+    """Извлекает хост и порт из строки вида vless://uuid@host:port?params"""
     try:
         raw = vless_line.split('#')[0].strip()
         parsed = urlparse(raw)
@@ -94,7 +85,9 @@ def get_host_port(vless_line):
         pass
     return None, None
 
+
 def check_ping(host, port):
+    """Возвращает задержку в мс или None при ошибке/превышении лимита"""
     try:
         start = time.time()
         with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
@@ -105,45 +98,36 @@ def check_ping(host, port):
         pass
     return None
 
+
 def translate_comment(line, flag, country):
+    """Заменяет комментарий после # на флаг + русское название"""
     uri_part = line.split('#', 1)[0] if '#' in line else line
     new_comment = quote(flag, safe='') + '%20' + quote(country, safe='')
     return uri_part + '#' + new_comment
 
-# ---------- ОБНОВЛЕНИЕ ----------
-def run_update():
-    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Начинаем обновление...")
 
+def main():
     candidates = {flag: [] for flag in COUNTRIES}
     seen = set()
-    decoded_cache = {}
 
     for url in SOURCES:
-        print(f"  Загрузка: {url}")
+        print(f"Загрузка: {url}")
         try:
             text = download(url)
         except Exception as e:
-            print(f"    Ошибка: {e}")
+            print(f"Ошибка загрузки: {e}")
             continue
 
-        lines = text.splitlines()
-        total_lines = len(lines)
-        print(f"    Всего строк в источнике: {total_lines}")
-
-        processed = 0
-        for line in lines:
+        for line in text.splitlines():
             line = line.strip()
-            processed += 1
-            if processed % 10 == 0:
-                print(f"    Обработано {processed}/{total_lines} строк...", end='\r')
-
             if not line or line in seen:
                 continue
 
-            if is_blacklisted(line, decoded_cache):
+            # Фильтр: пропускаем строки с запрещёнными словами
+            if is_blacklisted(line):
                 continue
 
-            result = find_country(line, decoded_cache)
+            result = find_country(line)
             if result is None:
                 continue
 
@@ -158,12 +142,10 @@ def run_update():
                 continue
 
             new_line = translate_comment(line, flag, country)
+
             candidates[flag].append((new_line, ping))
             seen.add(line)
 
-        print(f"    Обработано {processed}/{total_lines} строк полностью.")
-
-    # Формируем вывод – ТОЛЬКО БЛОКИ СТРАН, БЕЗ ЗАГОЛОВКОВ
     output_lines = []
     total = 0
 
@@ -173,41 +155,26 @@ def run_update():
             continue
 
         items.sort(key=lambda x: x[1])
-        selected = items[:limit]
+        selected = items[:limit] if len(items) >= limit else items
 
         output_lines.append(f"# {flag} {country}")
         for line, _ in selected:
             output_lines.append(line)
-        output_lines.append("")  # пустая строка между блоками
+        output_lines.append("")
 
         total += len(selected)
 
-    # Записываем, убирая последний лишний перевод строки, если он есть
-    content = "\n".join(output_lines).rstrip()
-    Path(OUTPUT).write_text(content, encoding="utf-8")
+    Path(OUTPUT).write_text("\n".join(output_lines), encoding="utf-8")
 
-    print(f"  Готово! Сохранено {total} конфигов.")
-    print("  Статистика по странам:")
+    print()
+    print("Результат:")
     for flag, (country, limit) in COUNTRIES.items():
         count = len(candidates[flag])
         if count:
-            print(f"    {flag} {country}: {count} проверено, взято {min(count, limit)} (лимит {limit})")
-    print(f"  Результат записан в {OUTPUT}")
+            print(f"{flag} {country}: {count} проверено, выбрано {min(count, limit)} (лимит {limit})")
+    print(f"Всего строк в результате: {total}")
+    print(f"Готово: {OUTPUT}")
 
-# ---------- ТОЧКА ВХОДА ----------
-def main():
-    print("Запущен автообновляемый сборщик конфигов")
-    print(f"Интервал обновления: {UPDATE_INTERVAL // 60} минут")
-    print("Нажмите Ctrl+C для остановки.\n")
-
-    try:
-        while True:
-            run_update()
-            print(f"Следующее обновление через {UPDATE_INTERVAL // 60} минут...")
-            time.sleep(UPDATE_INTERVAL)
-    except KeyboardInterrupt:
-        print("\nОстановлено пользователем.")
-        sys.exit(0)
 
 if __name__ == "__main__":
     main()
