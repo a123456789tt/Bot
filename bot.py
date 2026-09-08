@@ -3,11 +3,17 @@ from urllib.parse import unquote, quote, urlparse
 from pathlib import Path
 import socket
 import time
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ---------- ИСТОЧНИКИ ----------
 SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
     "https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt",
+    # Новые рабочие источники
+    "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/output/kind/vless.txt",
+    "https://github.com/Mr-Meshky/vify/raw/refs/heads/main/configs/vless.txt",
 ]
 
 OUTPUT = "result.txt"
@@ -31,10 +37,10 @@ COUNTRIES = {
     "🇵🇱": ("Польша", 5),
 }
 
-PING_LIMIT_MS = 800
-TCP_TIMEOUT = 2.0
-
-# Список запрещённых слов (регистронезависимо)
+# ---------- НАСТРОЙКИ ПИНГА ----------
+PING_LIMIT_MS = 1000          # увеличено до 1000 мс (1 секунда)
+TCP_TIMEOUT = 10.0            # таймаут соединения 10 секунд
+MAX_WORKERS = 50              # потоков для параллельного пинга
 BLACKLIST_WORDS = ["analyst"]
 
 
@@ -56,24 +62,25 @@ def decode_name(line):
     return name
 
 
-def is_blacklisted(line):
-    """Проверяет, содержит ли строка или её декодированный комментарий запрещённые слова."""
-    decoded = decode_name(line)
-    # Объединяем исходную строку и декодированный комментарий для проверки
+def is_blacklisted(line, decoded_cache):
+    if line not in decoded_cache:
+        decoded_cache[line] = decode_name(line)
+    decoded = decoded_cache[line]
     text_to_check = (line + " " + decoded).lower()
     return any(word in text_to_check for word in BLACKLIST_WORDS)
 
 
-def find_country(line):
-    decoded_name = decode_name(line)
+def find_country(line, decoded_cache):
+    if line not in decoded_cache:
+        decoded_cache[line] = decode_name(line)
+    decoded = decoded_cache[line]
     for flag, (country, _) in COUNTRIES.items():
-        if flag in decoded_name:
+        if flag in decoded:
             return flag, country
     return None
 
 
 def get_host_port(vless_line):
-    """Извлекает хост и порт из строки вида vless://uuid@host:port?params"""
     try:
         raw = vless_line.split('#')[0].strip()
         parsed = urlparse(raw)
@@ -87,7 +94,6 @@ def get_host_port(vless_line):
 
 
 def check_ping(host, port):
-    """Возвращает задержку в мс или None при ошибке/превышении лимита"""
     try:
         start = time.time()
         with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
@@ -100,52 +106,102 @@ def check_ping(host, port):
 
 
 def translate_comment(line, flag, country):
-    """Заменяет комментарий после # на флаг + русское название"""
     uri_part = line.split('#', 1)[0] if '#' in line else line
     new_comment = quote(flag, safe='') + '%20' + quote(country, safe='')
     return uri_part + '#' + new_comment
 
 
+def ping_worker(line, flag, country, host, port):
+    ping = check_ping(host, port)
+    if ping is not None:
+        new_line = translate_comment(line, flag, country)
+        return (flag, new_line, ping)
+    return None
+
+
 def main():
-    candidates = {flag: [] for flag in COUNTRIES}
+    print("=== Запуск сборщика конфигов (порог пинга 1000 мс) ===")
+
+    raw_candidates = {flag: [] for flag in COUNTRIES}
     seen = set()
+    decoded_cache = {}
+    stats = {
+        "total_lines": 0,
+        "blacklisted": 0,
+        "no_country": 0,
+        "no_host": 0,
+        "duplicate": 0,
+        "empty": 0,
+    }
 
     for url in SOURCES:
-        print(f"Загрузка: {url}")
+        print(f"\nЗагрузка: {url}")
         try:
             text = download(url)
         except Exception as e:
-            print(f"Ошибка загрузки: {e}")
+            print(f"  Ошибка загрузки: {e}")
             continue
 
-        for line in text.splitlines():
+        lines = text.splitlines()
+        stats["total_lines"] += len(lines)
+        print(f"  Получено строк: {len(lines)}")
+
+        for line in lines:
             line = line.strip()
-            if not line or line in seen:
+            if not line:
+                stats["empty"] += 1
                 continue
 
-            # Фильтр: пропускаем строки с запрещёнными словами
-            if is_blacklisted(line):
+            if line in seen:
+                stats["duplicate"] += 1
                 continue
 
-            result = find_country(line)
+            if is_blacklisted(line, decoded_cache):
+                stats["blacklisted"] += 1
+                continue
+
+            result = find_country(line, decoded_cache)
             if result is None:
+                stats["no_country"] += 1
                 continue
 
             flag, country = result
 
             host, port = get_host_port(line)
             if not host or not port:
+                stats["no_host"] += 1
                 continue
 
-            ping = check_ping(host, port)
-            if ping is None:
-                continue
-
-            new_line = translate_comment(line, flag, country)
-
-            candidates[flag].append((new_line, ping))
+            raw_candidates[flag].append((line, country, host, port))
             seen.add(line)
 
+    # Параллельный пинг
+    print("\nНачинаем параллельную проверку пинга (таймаут 10 с, лимит 1000 мс)...")
+    candidates = {flag: [] for flag in COUNTRIES}
+    total_to_ping = sum(len(lst) for lst in raw_candidates.values())
+    pinged = 0
+    stats["ping_fail"] = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = []
+        for flag, items in raw_candidates.items():
+            for line, country, host, port in items:
+                futures.append(executor.submit(ping_worker, line, flag, country, host, port))
+
+        for future in as_completed(futures):
+            pinged += 1
+            if pinged % 20 == 0:
+                print(f"  Проверено пингов: {pinged}/{total_to_ping}", end='\r')
+            result = future.result()
+            if result is not None:
+                flag, new_line, ping = result
+                candidates[flag].append((new_line, ping))
+            else:
+                stats["ping_fail"] += 1
+
+    print(f"  Проверено пингов: {pinged}/{total_to_ping}")
+
+    # Формируем вывод
     output_lines = []
     total = 0
 
@@ -155,7 +211,7 @@ def main():
             continue
 
         items.sort(key=lambda x: x[1])
-        selected = items[:limit] if len(items) >= limit else items
+        selected = items[:limit]
 
         output_lines.append(f"# {flag} {country}")
         for line, _ in selected:
@@ -164,16 +220,36 @@ def main():
 
         total += len(selected)
 
-    Path(OUTPUT).write_text("\n".join(output_lines), encoding="utf-8")
+    if total == 0:
+        output_lines = [
+            "# Конфиги не найдены. Возможные причины:",
+            "# - все сервера имеют пинг > 1000 мс или таймаут >10 с",
+            "# - все конфиги отфильтрованы как 'analyst'",
+            "# - нет подходящих строк с флагами стран",
+            "# Проверьте логи выше."
+        ]
 
-    print()
-    print("Результат:")
+    content = "\n".join(output_lines).rstrip()
+    Path(OUTPUT).write_text(content, encoding="utf-8")
+
+    print("\n=== СТАТИСТИКА ===")
+    print(f"Всего строк в источниках: {stats['total_lines']}")
+    print(f"Пустых строк: {stats['empty']}")
+    print(f"Дубликатов: {stats['duplicate']}")
+    print(f"Отфильтровано как 'analyst': {stats['blacklisted']}")
+    print(f"Не удалось определить страну: {stats['no_country']}")
+    print(f"Нет хоста/порта: {stats['no_host']}")
+    print(f"Не прошли пинг (>{PING_LIMIT_MS} мс или таймаут >{TCP_TIMEOUT} с): {stats['ping_fail']}")
+
+    print("\n=== РЕЗУЛЬТАТ ПО СТРАНАМ ===")
     for flag, (country, limit) in COUNTRIES.items():
         count = len(candidates[flag])
         if count:
-            print(f"{flag} {country}: {count} проверено, выбрано {min(count, limit)} (лимит {limit})")
-    print(f"Всего строк в результате: {total}")
-    print(f"Готово: {OUTPUT}")
+            print(f"{flag} {country}: {count} проверено, взято {min(count, limit)} (лимит {limit})")
+
+    print(f"\nВсего строк в результате: {total}")
+    print(f"Результат записан в {OUTPUT}")
+    print("=== Готово ===")
 
 
 if __name__ == "__main__":
