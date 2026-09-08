@@ -4,13 +4,10 @@ from pathlib import Path
 import socket
 import time
 
-# Добавлены новые источники
 SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
     "https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt",
-    "https://github.com/Mr-Meshky/vify/raw/refs/heads/main/configs/vless.txt",
-    "https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt",
 ]
 
 OUTPUT = "result.txt"
@@ -35,7 +32,7 @@ COUNTRIES = {
 }
 
 PING_LIMIT_MS = 800
-TCP_TIMEOUT = 2.0
+TCP_TIMEOUT = 2.0  # секунды, чтобы не ждать слишком долго
 
 
 def download(url):
@@ -67,10 +64,12 @@ def find_country(line):
 def get_host_port(vless_line):
     """Извлекает хост и порт из строки вида vless://uuid@host:port?params"""
     try:
+        # Обрезаем возможный фрагмент после '#'
         raw = vless_line.split('#')[0].strip()
         parsed = urlparse(raw)
         if parsed.hostname and parsed.port:
             return parsed.hostname, parsed.port
+        # Если порт не указан, стандартный для VLESS – 443
         if parsed.hostname:
             return parsed.hostname, 443
     except Exception:
@@ -83,7 +82,7 @@ def check_ping(host, port):
     try:
         start = time.time()
         with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
-            elapsed = (time.time() - start) * 1000
+            elapsed = (time.time() - start) * 1000  # в мс
         if elapsed <= PING_LIMIT_MS:
             return elapsed
     except Exception:
@@ -91,21 +90,10 @@ def check_ping(host, port):
     return None
 
 
-def translate_config_line(line, country):
-    """
-    Заменяет оригинальный комментарий (часть после #) на русское название страны.
-    Если комментария нет – добавляет его в конец.
-    """
-    if '#' in line:
-        base, _ = line.split('#', 1)
-        return f"{base}#{country}"
-    else:
-        return f"{line}#{country}"
-
-
 def main():
+    # Словарь для хранения кандидатов: flag -> list of (line, ping_ms)
     candidates = {flag: [] for flag in COUNTRIES}
-    seen = set()
+    seen = set()  # для уникальности строк
 
     for url in SOURCES:
         print(f"Загрузка: {url}")
@@ -120,30 +108,27 @@ def main():
             if not line or line in seen:
                 continue
 
-            # --- Фильтр: пропускаем конфиги, содержащие "analyst" (регистронезависимо) ---
-            if "analyst" in line.lower():
-                continue
-
             result = find_country(line)
             if result is None:
                 continue
 
-            flag, country = result
+            flag, _ = result
 
+            # Извлекаем хост и порт
             host, port = get_host_port(line)
             if not host or not port:
                 continue
 
+            # Проверяем пинг
             ping = check_ping(host, port)
             if ping is None:
-                continue
+                continue  # не прошёл по времени или недоступен
 
-            # --- Перевод комментария на русский ---
-            new_line = translate_config_line(line, country)
-
-            candidates[flag].append((new_line, ping))
+            # Сохраняем
+            candidates[flag].append((line, ping))
             seen.add(line)
 
+    # Формируем итоговый список для вывода
     output_lines = []
     total = 0
 
@@ -152,16 +137,20 @@ def main():
         if not items:
             continue
 
+        # Сортируем по пингу (от лучшего к худшему)
         items.sort(key=lambda x: x[1])
+
+        # Берём не больше лимита (если меньше – все)
         selected = items[:limit] if len(items) >= limit else items
 
         output_lines.append(f"# {flag} {country}")
         for line, _ in selected:
             output_lines.append(line)
-        output_lines.append("")
+        output_lines.append("")  # пустая строка после блока
 
         total += len(selected)
 
+    # Записываем результат
     Path(OUTPUT).write_text("\n".join(output_lines), encoding="utf-8")
 
     print()
