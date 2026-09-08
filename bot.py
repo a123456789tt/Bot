@@ -1,5 +1,4 @@
 import requests
-import requests
 from urllib.parse import unquote, quote, urlparse
 from pathlib import Path
 import socket
@@ -14,8 +13,6 @@ SOURCES = [
 ]
 
 OUTPUT = "result.txt"
-VPN_NAME = "fazZzeta VPN"
-TG_LINK = "https://t.me/fazzzeta_vpn"
 
 COUNTRIES = {
     "🇳🇱": ("Нидерланды", 10),
@@ -35,7 +32,6 @@ COUNTRIES = {
     "🇹🇷": ("Турция", 5),
     "🇵🇱": ("Польша", 5),
     "🇧🇷": ("Бразилия", 3),
-    # Новые страны
     "🇦🇹": ("Австрия", 3),
     "🇪🇪": ("Эстония", 3),
     "🇩🇰": ("Дания", 3),
@@ -48,7 +44,7 @@ COUNTRIES = {
 }
 
 PING_LIMIT_MS = 800
-TCP_TIMEOUT = 2.0
+TCP_TIMEOUT = 1.5
 UPDATE_INTERVAL = 3600  # 1 час
 
 BLACKLIST_WORDS = ["analyst"]
@@ -70,15 +66,19 @@ def decode_name(line):
         name = decoded
     return name
 
-def find_country(line):
-    decoded = decode_name(line)
+def find_country(line, decoded_cache):
+    if line not in decoded_cache:
+        decoded_cache[line] = decode_name(line)
+    decoded = decoded_cache[line]
     for flag, (country, _) in COUNTRIES.items():
         if flag in decoded:
             return flag, country
     return None
 
-def is_blacklisted(line):
-    decoded = decode_name(line)
+def is_blacklisted(line, decoded_cache):
+    if line not in decoded_cache:
+        decoded_cache[line] = decode_name(line)
+    decoded = decoded_cache[line]
     check_text = (line + " " + decoded).lower()
     return any(word in check_text for word in BLACKLIST_WORDS)
 
@@ -116,6 +116,7 @@ def run_update():
 
     candidates = {flag: [] for flag in COUNTRIES}
     seen = set()
+    decoded_cache = {}
 
     for url in SOURCES:
         print(f"  Загрузка: {url}")
@@ -125,15 +126,24 @@ def run_update():
             print(f"    Ошибка: {e}")
             continue
 
-        for line in text.splitlines():
+        lines = text.splitlines()
+        total_lines = len(lines)
+        print(f"    Всего строк в источнике: {total_lines}")
+
+        processed = 0
+        for line in lines:
             line = line.strip()
+            processed += 1
+            if processed % 10 == 0:
+                print(f"    Обработано {processed}/{total_lines} строк...", end='\r')
+
             if not line or line in seen:
                 continue
 
-            if is_blacklisted(line):
+            if is_blacklisted(line, decoded_cache):
                 continue
 
-            result = find_country(line)
+            result = find_country(line, decoded_cache)
             if result is None:
                 continue
 
@@ -151,14 +161,10 @@ def run_update():
             candidates[flag].append((new_line, ping))
             seen.add(line)
 
-    # Формируем вывод с указанием подписки, поддержки и интервала
-    output_lines = [
-        f"# Подписка: {VPN_NAME}",
-        f"# Поддержка: {TG_LINK}",
-        f"# Обновление: каждый час",
-        ""
-    ]
+        print(f"    Обработано {processed}/{total_lines} строк полностью.")
 
+    # Формируем вывод – ТОЛЬКО БЛОКИ СТРАН, БЕЗ ЗАГОЛОВКОВ
+    output_lines = []
     total = 0
 
     for flag, (country, limit) in COUNTRIES.items():
@@ -172,11 +178,13 @@ def run_update():
         output_lines.append(f"# {flag} {country}")
         for line, _ in selected:
             output_lines.append(line)
-        output_lines.append("")
+        output_lines.append("")  # пустая строка между блоками
 
         total += len(selected)
 
-    Path(OUTPUT).write_text("\n".join(output_lines), encoding="utf-8")
+    # Записываем, убирая последний лишний перевод строки, если он есть
+    content = "\n".join(output_lines).rstrip()
+    Path(OUTPUT).write_text(content, encoding="utf-8")
 
     print(f"  Готово! Сохранено {total} конфигов.")
     print("  Статистика по странам:")
@@ -188,8 +196,7 @@ def run_update():
 
 # ---------- ТОЧКА ВХОДА ----------
 def main():
-    print(f"Запущен автообновляемый сборщик конфигов для {VPN_NAME}")
-    print(f"Поддержка: {TG_LINK}")
+    print("Запущен автообновляемый сборщик конфигов")
     print(f"Интервал обновления: {UPDATE_INTERVAL // 60} минут")
     print("Нажмите Ctrl+C для остановки.\n")
 
