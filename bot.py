@@ -1,5 +1,5 @@
 import requests
-from urllib.parse import unquote, quote, urlparse
+from urllib.parse import unquote, urlparse
 from pathlib import Path
 import socket
 import time
@@ -8,11 +8,12 @@ SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
     "https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt",
+    "https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/26.txt",          # новый
+    "https://github.com/Mr-Meshky/vify/raw/refs/heads/main/configs/vless.txt",                          # новый
 ]
 
 OUTPUT = "result.txt"
 
-# ↓ Вы можете заменить этот словарь на свой (как вы правили на скриншотах)
 COUNTRIES = {
     "🇳🇱": ("Нидерланды", 5),
     "🇫🇮": ("Финляндия", 5),
@@ -30,13 +31,22 @@ COUNTRIES = {
     "🇸🇪": ("Швеция", 5),
     "🇹🇷": ("Турция", 5),
     "🇵🇱": ("Польша", 5),
+    # Новые страны
+    "🇨🇳": ("Китай", 5),
+    "🇮🇳": ("Индия", 5),
+    # Африка (по 5)
+    "🇪🇬": ("Египет", 5),
+    "🇿🇦": ("ЮАР", 5),
+    "🇳🇬": ("Нигерия", 5),
+    "🇰🇪": ("Кения", 5),
+    "🇲🇦": ("Марокко", 5),
 }
 
 PING_LIMIT_MS = 800
-TCP_TIMEOUT = 1.5          # ← вы уменьшили до 1.5 секунд
-UPDATE_INTERVAL = 3600     # 1 час (используется только для вывода)
+TCP_TIMEOUT = 1.5
+UPDATE_INTERVAL = 3600     # 1 час
 
-BLACKLIST_WORDS = ["analyst"]  # если нужно, добавьте свои
+BLACKLIST_WORDS = ["analyst"]
 
 
 def download(url):
@@ -58,7 +68,6 @@ def decode_name(line):
 
 
 def find_country(line, decoded_cache):
-    """Возвращает флаг и страну, используя кеш декодированных имён"""
     if line not in decoded_cache:
         decoded_cache[line] = decode_name(line)
     decoded = decoded_cache[line]
@@ -69,7 +78,6 @@ def find_country(line, decoded_cache):
 
 
 def is_blacklisted(line, decoded_cache):
-    """Проверяет наличие слов из BLACKLIST_WORDS в строке или её декодированном имени"""
     if line not in decoded_cache:
         decoded_cache[line] = decode_name(line)
     decoded = decoded_cache[line]
@@ -78,7 +86,6 @@ def is_blacklisted(line, decoded_cache):
 
 
 def get_host_port(vless_line):
-    """Извлекает хост и порт из строки вида vless://uuid@host:port?params"""
     try:
         raw = vless_line.split('#')[0].strip()
         parsed = urlparse(raw)
@@ -92,7 +99,6 @@ def get_host_port(vless_line):
 
 
 def check_ping(host, port):
-    """Возвращает задержку в мс или None при ошибке/превышении лимита"""
     try:
         start = time.time()
         with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
@@ -104,95 +110,133 @@ def check_ping(host, port):
     return None
 
 
-def main():
-    print("Запущен автообновляемый сборщик конфигов")
-    print(f"Интервал обновления: {UPDATE_INTERVAL // 60} минут")
-    print("Нажмите Ctrl+C для остановки.\n")
-
-    candidates = {flag: [] for flag in COUNTRIES}
-    seen = set()
-    decoded_cache = {}
-
-    for url in SOURCES:
-        print(f"Загрузка: {url}")
-        try:
-            text = download(url)
-        except Exception as e:
-            print(f"Ошибка загрузки: {e}")
-            continue
-
-        lines = text.splitlines()
-        total_lines = len(lines)
-        print(f"В источнике строк: {total_lines}")
-
-        processed = 0
-        for line in lines:
+def load_existing_configs(filename, decoded_cache):
+    existing = []
+    if not Path(filename).exists():
+        return existing
+    with open(filename, 'r', encoding='utf-8') as f:
+        for line in f:
             line = line.strip()
-            processed += 1
-            if processed % 10 == 0:
-                print(f"Обработано {processed}/{total_lines} строк...", end='\r')
+            if line.startswith("vless://"):
+                if is_blacklisted(line, decoded_cache):
+                    continue
+                if find_country(line, decoded_cache) is None:
+                    continue
+                existing.append(line)
+    return existing
 
-            if not line or line in seen:
+
+def main_cycle():
+    print("🚀 Автообновляемый сборщик конфигов запущен.")
+    print(f"🔄 Интервал обновления: {UPDATE_INTERVAL // 60} минут")
+    print("⏹ Нажмите Ctrl+C для остановки.\n")
+
+    while True:
+        print(f"\n⏰ Обновление в {time.strftime('%H:%M:%S')}")
+        candidates = {flag: [] for flag in COUNTRIES}
+        seen = set()
+        decoded_cache = {}
+
+        # 1. Загружаем уже сохранённые конфиги
+        existing = load_existing_configs(OUTPUT, decoded_cache)
+        print(f"📂 Загружено существующих конфигов: {len(existing)}")
+        for line in existing:
+            if line in seen:
                 continue
-
-            if is_blacklisted(line, decoded_cache):
+            flag, _ = find_country(line, decoded_cache)
+            if flag is None:
                 continue
-
-            result = find_country(line, decoded_cache)
-            if result is None:
-                continue
-
-            flag, _ = result
-
             host, port = get_host_port(line)
             if not host or not port:
                 continue
-
             ping = check_ping(host, port)
             if ping is None:
                 continue
-
             candidates[flag].append((line, ping))
             seen.add(line)
 
-        print(f"Обработано {processed}/{total_lines} строк полностью.")
+        # 2. Загружаем из удалённых источников
+        for url in SOURCES:
+            print(f"⬇️ Загрузка: {url}")
+            try:
+                text = download(url)
+            except Exception as e:
+                print(f"❌ Ошибка загрузки: {e}")
+                continue
 
-    # Формируем вывод – только блоки стран, без заголовков
-    output_lines = []
-    total = 0
+            lines = text.splitlines()
+            total_lines = len(lines)
+            processed = 0
+            for line in lines:
+                line = line.strip()
+                processed += 1
+                if processed % 10 == 0:
+                    print(f"   Обработано {processed}/{total_lines} строк...", end='\r')
 
-    for flag, (country, limit) in COUNTRIES.items():
-        items = candidates[flag]
-        if not items:
-            continue
+                if not line or line in seen:
+                    continue
 
-        items.sort(key=lambda x: x[1])
-        selected = items[:limit] if len(items) >= limit else items
+                if is_blacklisted(line, decoded_cache):
+                    continue
 
-        output_lines.append(f"# {flag} {country}")
-        for line, _ in selected:
-            output_lines.append(line)
-        output_lines.append("")   # пустая строка между блоками
+                result = find_country(line, decoded_cache)
+                if result is None:
+                    continue
 
-        total += len(selected)
+                flag, _ = result
+                host, port = get_host_port(line)
+                if not host or not port:
+                    continue
 
-    # Записываем, убирая последний лишний перевод строки
-    content = "\n".join(output_lines).rstrip()
-    Path(OUTPUT).write_text(content, encoding="utf-8")
+                ping = check_ping(host, port)
+                if ping is None:
+                    continue
 
-    print(f"\nГотово! Сохранено {total} конфигов.")
-    print("Статистика по странам:")
-    for flag, (country, limit) in COUNTRIES.items():
-        count = len(candidates[flag])
-        if count:
-            print(f"{flag} {country}: {count} проверено, выбрано {min(count, limit)} (лимит {limit})")
+                candidates[flag].append((line, ping))
+                seen.add(line)
+
+            print(f"   Обработано {processed}/{total_lines} строк полностью.")
+
+        # 3. Формируем финальный результат
+        output_lines = []
+        total = 0
+
+        for flag, (country, limit) in COUNTRIES.items():
+            items = candidates[flag]
+            if not items:
+                continue
+
+            items.sort(key=lambda x: x[1])
+            selected = items[:limit] if len(items) >= limit else items
+
+            output_lines.append(f"# {flag} {country}")
+            for line, _ in selected:
+                output_lines.append(line)
+            output_lines.append("")
+
+            total += len(selected)
+
+        content = "\n".join(output_lines).rstrip()
+        Path(OUTPUT).write_text(content, encoding="utf-8")
+
+        print(f"✅ Готово! Сохранено {total} рабочих конфигов.")
+        print("📊 Статистика по странам:")
+        for flag, (country, limit) in COUNTRIES.items():
+            count = len(candidates[flag])
+            if count:
+                chosen = min(count, limit)
+                print(f"   {flag} {country}: проверено {count}, выбрано {chosen} (лимит {limit})")
+
+        print(f"⏳ Следующее обновление через {UPDATE_INTERVAL // 60} минут...")
+        time.sleep(UPDATE_INTERVAL)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        main_cycle()
+    except KeyboardInterrupt:
+        print("\n👋 Остановлено пользователем.")
     except Exception as e:
         import traceback
-        print("\n=== Ошибка в bot.py ===")
+        print("\n=== Ошибка ===")
         traceback.print_exc()
-        raise   # чтобы GitHub Actions зафиксировал сбой
